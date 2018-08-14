@@ -11,6 +11,7 @@
  */
 package org.eclipse.che.api.git;
 
+import static java.nio.file.Files.getLastModifiedTime;
 import static java.util.Collections.singletonList;
 import static org.eclipse.che.api.fs.server.WsPathUtils.SEPARATOR;
 import static org.eclipse.che.api.fs.server.WsPathUtils.absolutize;
@@ -20,10 +21,16 @@ import static org.eclipse.che.api.project.server.VcsStatusProvider.VcsStatus.MOD
 import static org.eclipse.che.api.project.server.VcsStatusProvider.VcsStatus.NOT_MODIFIED;
 import static org.eclipse.che.api.project.server.VcsStatusProvider.VcsStatus.UNTRACKED;
 
-import java.util.ArrayList;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.attribute.FileTime;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
 import javax.inject.Inject;
 import org.eclipse.che.api.core.NotFoundException;
 import org.eclipse.che.api.core.ServerException;
@@ -35,6 +42,7 @@ import org.eclipse.che.api.git.shared.Status;
 import org.eclipse.che.api.git.shared.StatusChangedEventDto;
 import org.eclipse.che.api.project.server.ProjectManager;
 import org.eclipse.che.api.project.server.VcsStatusProvider;
+import org.eclipse.che.api.project.server.impl.RootDirPathProvider;
 import org.eclipse.che.api.project.server.notification.ProjectDeletedEvent;
 
 /**
@@ -47,18 +55,23 @@ public class GitStatusProvider implements VcsStatusProvider {
   private final GitConnectionFactory gitConnectionFactory;
   private final PathTransformer pathTransformer;
   private final ProjectManager projectManager;
+  private final RootDirPathProvider rootDirPathProvider;
   private final Map<String, Status> statusCache;
+  private final Map<String, FileTime> files;
 
   @Inject
   public GitStatusProvider(
       GitConnectionFactory gitConnectionFactory,
       PathTransformer pathTransformer,
       ProjectManager projectManager,
+      RootDirPathProvider rootDirPathProvider,
       EventService eventService) {
     this.gitConnectionFactory = gitConnectionFactory;
     this.pathTransformer = pathTransformer;
     this.projectManager = projectManager;
+    this.rootDirPathProvider = rootDirPathProvider;
     this.statusCache = new HashMap<>();
+    this.files = new HashMap<>();
 
     eventService.subscribe(
         event -> statusCache.put(event.getProjectName(), event.getStatus()),
@@ -69,6 +82,19 @@ public class GitStatusProvider implements VcsStatusProvider {
             statusCache.remove(
                 event.getProjectPath().substring(event.getProjectPath().lastIndexOf('/') + 1)),
         ProjectDeletedEvent.class);
+
+    try {
+      Set<Path> collect =
+          Files.walk(Paths.get(rootDirPathProvider.get()))
+              .filter(Files::isRegularFile)
+              .collect(Collectors.toSet());
+      for (Path path : collect) {
+        String filePath = path.toString();
+        files.put(filePath, getLastModifiedTime(Paths.get(filePath)));
+      }
+    } catch (IOException e) {
+      e.printStackTrace();
+    }
   }
 
   @Override
@@ -131,6 +157,19 @@ public class GitStatusProvider implements VcsStatusProvider {
       paths.forEach(
           path -> {
             String itemWsPath = resolve(project.getPath(), path);
+
+            FileTime fileTime = files.get(rootDirPathProvider.get() + itemWsPath);
+            try {
+              FileTime newFileTime =
+                  getLastModifiedTime(Paths.get(rootDirPathProvider.get() + itemWsPath));
+              if (!newFileTime.equals(fileTime)) {
+                files.put(rootDirPathProvider.get() + itemWsPath, newFileTime);
+                status.getModified().add(path);
+              }
+            } catch (IOException e) {
+              e.printStackTrace();
+            }
+
             if (status.getUntracked().contains(path)) {
               result.put(itemWsPath, UNTRACKED);
             } else if (status.getAdded().contains(path)) {
