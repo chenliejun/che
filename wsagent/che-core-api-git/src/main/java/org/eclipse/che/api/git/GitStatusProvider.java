@@ -16,10 +16,10 @@ import static java.util.Collections.singletonList;
 import static org.eclipse.che.api.fs.server.WsPathUtils.SEPARATOR;
 import static org.eclipse.che.api.fs.server.WsPathUtils.absolutize;
 import static org.eclipse.che.api.fs.server.WsPathUtils.resolve;
-import static org.eclipse.che.api.project.server.VcsStatusProvider.VcsStatus.ADDED;
 import static org.eclipse.che.api.project.server.VcsStatusProvider.VcsStatus.MODIFIED;
 import static org.eclipse.che.api.project.server.VcsStatusProvider.VcsStatus.NOT_MODIFIED;
 import static org.eclipse.che.api.project.server.VcsStatusProvider.VcsStatus.UNTRACKED;
+import static org.eclipse.che.dto.server.DtoFactory.newDto;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -38,11 +38,13 @@ import org.eclipse.che.api.core.model.workspace.config.ProjectConfig;
 import org.eclipse.che.api.core.notification.EventService;
 import org.eclipse.che.api.fs.server.PathTransformer;
 import org.eclipse.che.api.git.exception.GitException;
+import org.eclipse.che.api.git.shared.FileChangedEventDto;
 import org.eclipse.che.api.git.shared.Status;
 import org.eclipse.che.api.git.shared.StatusChangedEventDto;
 import org.eclipse.che.api.project.server.ProjectManager;
 import org.eclipse.che.api.project.server.VcsStatusProvider;
 import org.eclipse.che.api.project.server.impl.RootDirPathProvider;
+import org.eclipse.che.api.project.server.notification.ProjectCreatedEvent;
 import org.eclipse.che.api.project.server.notification.ProjectDeletedEvent;
 
 /**
@@ -74,13 +76,63 @@ public class GitStatusProvider implements VcsStatusProvider {
     this.files = new HashMap<>();
 
     eventService.subscribe(
-        event -> statusCache.put(event.getProjectName(), event.getStatus()),
+        event -> {
+          statusCache.put(event.getProjectName(), event.getStatus());
+        },
         StatusChangedEventDto.class);
 
     eventService.subscribe(
-        event ->
-            statusCache.remove(
-                event.getProjectPath().substring(event.getProjectPath().lastIndexOf('/') + 1)),
+        event -> {
+          FileChangedEventDto.Status status = event.getStatus();
+          Status statusDto = newDto(Status.class);
+          if (status == FileChangedEventDto.Status.ADDED) {
+            statusDto.setAdded(singletonList(event.getPath()));
+          } else if (status == FileChangedEventDto.Status.MODIFIED) {
+            statusDto.setModified(singletonList(event.getPath()));
+          } else if (status == FileChangedEventDto.Status.UNTRACKED) {
+            statusDto.setModified(singletonList(event.getPath()));
+          }
+
+          String projectName = Paths.get(event.getPath()).getParent().getFileName().toString();
+          statusCache.put(projectName, mergeStatus(projectName, statusDto));
+
+          String filePath = rootDirPathProvider.get() + event.getPath();
+          try {
+            files.put(filePath, getLastModifiedTime(Paths.get(filePath)));
+          } catch (IOException e) {
+            e.printStackTrace();
+          }
+        },
+        FileChangedEventDto.class);
+
+    eventService.subscribe(
+        event -> {
+          String projectFsPath = pathTransformer.transform(event.getProjectPath()).toString();
+          try {
+            Set<Path> paths =
+                Files.walk(Paths.get(projectFsPath))
+                    .filter(Files::isRegularFile)
+                    .collect(Collectors.toSet());
+            for (Path path : paths) {
+              String filePath = path.toString();
+              files.put(filePath, getLastModifiedTime(Paths.get(filePath)));
+            }
+            statusCache.put(
+                event.getProjectPath().substring(event.getProjectPath().lastIndexOf('/') + 1),
+                gitConnectionFactory.getConnection(projectFsPath).status(null));
+          } catch (GitException | IOException e) {
+            e.printStackTrace();
+          }
+        },
+        ProjectCreatedEvent.class);
+
+    eventService.subscribe(
+        event -> {
+          String projectFsPath = pathTransformer.transform(event.getProjectPath()).toString();
+          files.keySet().removeIf(file -> file.startsWith(projectFsPath));
+          statusCache.remove(
+              event.getProjectPath().substring(event.getProjectPath().lastIndexOf('/') + 1));
+        },
         ProjectDeletedEvent.class);
 
     try {
@@ -123,7 +175,7 @@ public class GitStatusProvider implements VcsStatusProvider {
         return UNTRACKED;
       } else if (status.getAdded().contains(itemPath)) {
         cachedStatus.getAdded().add(itemPath);
-        return ADDED;
+        return VcsStatus.ADDED;
       } else if (status.getModified().contains(itemPath)) {
         cachedStatus.getModified().add(itemPath);
         return MODIFIED;
@@ -148,32 +200,47 @@ public class GitStatusProvider implements VcsStatusProvider {
               .getClosest(absolutize(wsPath))
               .orElseThrow(() -> new NotFoundException("Can't find project"));
       String projectName = project.getName();
+      String projectFsPath = pathTransformer.transform(project.getPath()).toString();
       if (statusCache.get(projectName) == null) {
-        String projectFsPath = pathTransformer.transform(project.getPath()).toString();
         statusCache.put(
-            projectName, gitConnectionFactory.getConnection(projectFsPath).status(paths));
+            projectName, gitConnectionFactory.getConnection(projectFsPath).status(null));
       }
-      Status status = statusCache.get(projectName);
+
+      boolean hasChanged = false;
+
+      for (String path : paths) {
+        String itemWsPath = resolve(project.getPath(), path);
+        FileTime lastFileTime = files.get(rootDirPathProvider.get() + itemWsPath);
+        try {
+          FileTime currentFileTime =
+              getLastModifiedTime(Paths.get(rootDirPathProvider.get() + itemWsPath));
+          if (lastFileTime == null || !lastFileTime.equals(currentFileTime)) {
+            files.put(rootDirPathProvider.get() + itemWsPath, currentFileTime);
+            hasChanged = true;
+          }
+        } catch (IOException e) {
+          e.printStackTrace();
+        }
+      }
+
+      Status status;
+      if (hasChanged) {
+        remove(projectName, paths);
+        status =
+            mergeStatus(
+                projectName, gitConnectionFactory.getConnection(projectFsPath).status(paths));
+        statusCache.put(projectName, status);
+      } else {
+        status = statusCache.get(projectName);
+      }
+
       paths.forEach(
           path -> {
             String itemWsPath = resolve(project.getPath(), path);
-
-            FileTime fileTime = files.get(rootDirPathProvider.get() + itemWsPath);
-            try {
-              FileTime newFileTime =
-                  getLastModifiedTime(Paths.get(rootDirPathProvider.get() + itemWsPath));
-              if (!newFileTime.equals(fileTime)) {
-                files.put(rootDirPathProvider.get() + itemWsPath, newFileTime);
-                status.getModified().add(path);
-              }
-            } catch (IOException e) {
-              e.printStackTrace();
-            }
-
             if (status.getUntracked().contains(path)) {
               result.put(itemWsPath, UNTRACKED);
             } else if (status.getAdded().contains(path)) {
-              result.put(itemWsPath, ADDED);
+              result.put(itemWsPath, VcsStatus.ADDED);
             } else if (status.getModified().contains(path) || status.getChanged().contains(path)) {
               result.put(itemWsPath, MODIFIED);
             } else {
@@ -185,5 +252,76 @@ public class GitStatusProvider implements VcsStatusProvider {
       throw new ServerException(e.getMessage());
     }
     return result;
+  }
+
+  private Status mergeStatus(String project, Status newStatus) {
+    Status status = statusCache.get(project);
+
+    newStatus
+        .getAdded()
+        .forEach(
+            added -> {
+              status.getAdded().add(added);
+            });
+    newStatus
+        .getChanged()
+        .forEach(
+            changed -> {
+              status.getChanged().add(changed);
+            });
+    newStatus
+        .getModified()
+        .forEach(
+            modified -> {
+              status.getModified().add(modified);
+            });
+    newStatus
+        .getUntracked()
+        .forEach(
+            untracked -> {
+              status.getUntracked().add(untracked);
+            });
+    newStatus
+        .getMissing()
+        .forEach(
+            missing -> {
+              status.getMissing().add(missing);
+            });
+    newStatus
+        .getRemoved()
+        .forEach(
+            removed -> {
+              status.getRemoved().add(removed);
+            });
+    newStatus
+        .getConflicting()
+        .forEach(
+            conflicting -> {
+              status.getConflicting().add(conflicting);
+            });
+    newStatus
+        .getUntrackedFolders()
+        .forEach(
+            untrackedFolders -> {
+              status.getUntrackedFolders().add(untrackedFolders);
+            });
+
+    return status;
+  }
+
+  private void remove(String project, List<String> paths) {
+    Status status = statusCache.get(project);
+
+    paths.forEach(
+        path -> {
+          status.getAdded().remove(path);
+          status.getChanged().remove(path);
+          status.getModified().remove(path);
+          status.getUntracked().remove(path);
+          status.getMissing().remove(path);
+          status.getRemoved().remove(path);
+          status.getConflicting().remove(path);
+          status.getUntrackedFolders().remove(path);
+        });
   }
 }
