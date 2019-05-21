@@ -30,6 +30,8 @@ If you are interested in fixing issues and contributing directly to the code bas
 - [Contributor license agreement](https://github.com/eclipse/che/wiki/Contributor-License-Agreement)
 
 ### Ecosystem
+
+file changed
 The next generation of Eclipse Che is going to be built from multiple components and plugins (learn more in [the roadmap](https://github.com/eclipse/che/wiki/Roadmap) on the wiki). This list provides links to those components and plugins.
 
 | Project        | Description  |
