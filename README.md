@@ -10,6 +10,9 @@ oooooo
 
 5555
 
+
+特瑞特人
+
 wrtert
 # Eclipse Che - Eclipse Next-Generation IDE
 [![Eclipse License](https://img.shields.io/badge/license-Eclipse-brightgreen.svg)](https://github.com/codenvy/che/blob/master/LICENSE)
